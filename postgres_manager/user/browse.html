@@ -1,0 +1,753 @@
+#!/usr/bin/env python3
+"""User-level data explorer: browse tables and run SQL.
+
+Safety model: every statement runs in a fresh psql session contained via
+SET ROLE to the user's own login role (+ statement_timeout). No passwords
+are stored or needed. Single statements only.
+"""
+import os
+import re
+import sys
+import urllib.parse
+sys.path.insert(0, "/usr/local/directadmin/plugins/postgres_manager/scripts")
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+except Exception:
+    pass
+from ui_lib import (e, get_da_user, parse_params, load_conf, helper_call, require_post,
+                    parse_list_output, parse_tabular, is_select_like,
+                    fmt_size, page_head, page_msg, form_style,
+                    render_crash, back_link)
+
+SELF = "/CMD_PLUGINS/postgres_manager/browse.html"
+PAGE = 100
+KIND = {"r": "table", "v": "view", "m": "mat.view", "f": "foreign"}
+COL_TYPES = ["serial", "bigserial", "smallint", "integer", "bigint",
+             "varchar(255)", "varchar(36)", "char(36)", "text", "boolean",
+             "timestamp", "timestamptz", "date", "time", "numeric",
+             "real", "double precision", "json", "jsonb", "uuid", "inet", "bytea"]
+CREATE_ROWS = 6
+
+
+def q(s):
+    return urllib.parse.quote(str(s), safe="")
+
+
+def ident(name):
+    if not re.match(r"^[a-z_][a-z0-9_]*$", name or ""):
+        raise ValueError(f"bad identifier: {name}")
+    return '"' + name + '"'
+
+
+def lit(s):
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def _stripped(sql):
+    s = re.sub(r"/\*.*?\*/", " ", sql or "", flags=re.S)
+    s = re.sub(r"--[^\n]*", " ", s)
+    s = re.sub(r"'[^']*'", "''", s)
+    s = re.sub(r'"[^"]*"', " ", s)
+    return s
+
+
+def run(user, db, role, sql):
+    if is_select_like(sql) and not re.search(r"(?i)\blimit\b", _stripped(sql)):
+        sql = sql.rstrip().rstrip(";") + " LIMIT 200"
+    return helper_call("query", user, db=db, role=role, sql=sql)
+
+
+def result_table(cols, rows, total=None):
+    h = ["<table><tr>"]
+    h += [f"<th>{e(c)}</th>" for c in cols]
+    h += ["</tr>"]
+    for r in rows:
+        h += ["<tr>"] + [f"<td>{e(c)}</td>" for c in r] + ["</tr>"]
+    h += ["</table>"]
+    if total is not None:
+        h += [f"<p style='font-size:12px'>{total} row(s).</p>"]
+    return "".join(h)
+
+
+def main():
+    DA_USER = get_da_user()
+    params = parse_params()
+    db = (params.get("db") or "").strip().lower()
+    role = (params.get("role") or "").strip().lower()
+    tbl = (params.get("tbl") or "").strip().lower()
+    sql = params.get("sql") or ""
+    view = (params.get("view") or "").strip()
+    try:
+        off = max(0, int(params.get("off") or 0))
+    except ValueError:
+        off = 0
+    ok_msg, err_msg = "", ""
+
+    rc_e, out_e, err_e = helper_call("ensure-user", DA_USER)
+    if rc_e != 0:
+        print(page_head("Data Explorer"))
+        print(form_style())
+        print('<div class="pg">')
+        print(back_link())
+        print(page_msg("", err_e or out_e or "Could not ensure owner role."))
+        print('</div>')
+        return
+    rc, out, err = helper_call("list", DA_USER)
+    if rc != 0:
+        print(page_head("Data Explorer"))
+        print(form_style())
+        print('<div class="pg">')
+        print(back_link())
+        print(page_msg("", err or "Could not list databases."))
+        print(f'<p><a href="/CMD_PLUGINS/postgres_manager">← Databases</a></p></div>')
+        return
+    data = parse_list_output(out)
+    dbs = data["dbs"]
+    login_roles = [r for r in data["roles"] if r["name"] != data["prefix"]]
+    db_names = [d["name"] for d in dbs]
+    role_names = [r["name"] for r in login_roles]
+
+    if db and db not in db_names:
+        err_msg = f"Unknown database '{db}'."
+        db = ""
+    if role and role not in role_names:
+        err_msg = f"Unknown role '{role}'."
+        role = ""
+    if not role and role_names:
+        role = role_names[0]
+
+    print(page_head(f"Data Explorer — {DA_USER}"))
+    print(form_style())
+    print('<div class="pg">')
+    print(back_link())
+    print(f'<p><a href="/CMD_PLUGINS/postgres_manager">← Databases</a></p>')
+    print(page_msg(ok_msg, err_msg))
+
+    # --- picker ---
+    print(f'''<div class="box"><h3>Database</h3>
+<form method="GET" action="{SELF}">''')
+    if not db_names:
+        print("<p>No databases yet. Create one on the main page first.</p>")
+    else:
+        print('Database: <select name="db">')
+        for d in db_names:
+            sel = " selected" if d == db else ""
+            print(f'<option value="{e(d)}"{sel}>{e(d)}</option>')
+        print('</select> ')
+        if role_names:
+            print('Run as: <select name="role">')
+            for r in role_names:
+                sel = " selected" if r == role else ""
+                print(f'<option value="{e(r)}"{sel}>{e(r)}</option>')
+            print('</select> ')
+        print('<input type="submit" value="Open">')
+    print('</form>')
+    if db and not role_names:
+        print('<p style="color:#b06000">Create a DB user on the main page to browse data / run SQL.</p>')
+    print('</div>')
+
+    if not db:
+        print("</div>")
+        return
+
+    # --- tables ---
+    tables = []
+    rc, out, err = helper_call("tables", DA_USER, db=db)
+    if rc == 0:
+        for line in out.splitlines():
+            line = line.strip()
+            if line == "---TABLES---" or not line:
+                continue
+            parts = line.split("|")
+            if len(parts) >= 4:
+                try:
+                    size = int(parts[2])
+                except ValueError:
+                    size = 0
+                try:
+                    nrow = int(parts[3])
+                except ValueError:
+                    nrow = 0
+                tables.append({"name": parts[0], "kind": parts[1], "size": size, "rows": nrow})
+    else:
+        print(page_msg("", err or "Could not list tables."))
+
+    # --- mutations (drop/truncate/delete/insert); run before display ---
+    table_names = [t["name"] for t in tables]
+    csvdir = os.path.join(os.environ.get("HOME") or f"/home/{DA_USER}", "pg_backups")
+    csvfiles = []
+    try:
+        for f in sorted(os.listdir(csvdir)):
+            fp = os.path.join(csvdir, f)
+            if f.endswith(".csv") and os.path.isfile(fp):
+                csvfiles.append(f)
+    except OSError:
+        pass
+
+    def need_ids():
+        if not tbl or tbl not in table_names:
+            print(page_msg("", f"Unknown table '{tbl}'."))
+            return None
+        try:
+            sch, tab = tbl.split(".", 1)
+            return ident(sch), ident(tab)
+        except ValueError:
+            print(page_msg("", f"Bad table name '{tbl}'."))
+            return None
+
+    if view in ("drop", "truncate") and tbl:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        else:
+            ids = need_ids()
+            if ids:
+                stmt = (f"DROP TABLE {ids[0]}.{ids[1]}" if view == "drop"
+                        else f"TRUNCATE {ids[0]}.{ids[1]}")
+                rc, out, err = run(DA_USER, db, role, stmt)
+                if rc == 0:
+                    print(page_msg(out or f"Table {tbl}: {view} done.", ""))
+                    if view == "drop":
+                        tables = [t for t in tables if t["name"] != tbl]
+                        table_names = [t["name"] for t in tables]
+                        tbl = ""
+                else:
+                    print(page_msg("", err or out or "Failed."))
+
+    _MUT_GET = view in ("drop", "truncate", "vacuum", "analyze", "dropcol") or (params.get("del_ctid") or "").strip()
+    _MUT_ACT = (params.get("action") or "") in ("insert_row", "update_row", "create_table",
+                                                "add_column", "rename_table", "import_csv")
+    if (_MUT_GET or _MUT_ACT) and not require_post():
+        print(page_msg("", "This action requires POST (use the buttons/forms, not direct links)."))
+        print("</div>")
+        return
+    del_ctid = (params.get("del_ctid") or "").strip()
+    if del_ctid and tbl:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif not re.match(r"^\(\d+,\d+\)$", del_ctid):
+            print(page_msg("", "Bad row id."))
+        else:
+            ids = need_ids()
+            if ids:
+                # ctid literal is safe: strictly validated ^\(\d+,\d+\)$ above
+                rc, out, err = run(DA_USER, db, role,
+                                   f"DELETE FROM {ids[0]}.{ids[1]} WHERE ctid = '{del_ctid}'")
+                if rc == 0:
+                    print(page_msg(out or "Row deleted.", ""))
+                else:
+                    print(page_msg("", err or out or "Delete failed."))
+
+    if (params.get("action") or "") == "insert_row":
+        ins_tbl = (params.get("ins_tbl") or "").strip().lower()
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif not ins_tbl or ins_tbl not in table_names:
+            print(page_msg("", f"Unknown table '{ins_tbl}'."))
+        else:
+            try:
+                sch, tab = ins_tbl.split(".", 1)
+                qs, qt = ident(sch), ident(tab)
+            except ValueError:
+                qs = qt = None
+                print(page_msg("", f"Bad table name '{ins_tbl}'."))
+            if qs:
+                cs = (f"SELECT column_name FROM information_schema.columns "
+                      f"WHERE table_schema = {lit(sch)} AND table_name = {lit(tab)} "
+                      f"ORDER BY ordinal_position")
+                rc, out, err = run(DA_USER, db, role, cs)
+                if rc != 0:
+                    print(page_msg("", err or out or "Could not read columns."))
+                else:
+                    ccols, crows = parse_tabular(out)
+                    colnames = [r[0] for r in crows if r]
+                    cnames, vals, bad = [], [], None
+                    for c in colnames:
+                        try:
+                            cnames.append(ident(c))
+                        except ValueError:
+                            bad = c
+                            break
+                        v = params.get("col_" + c, "")
+                        vals.append("NULL" if v == "" else lit(v))
+                    if bad:
+                        print(page_msg("", f"Unsupported column name '{bad}'."))
+                    elif not cnames:
+                        print(page_msg("", "No columns found."))
+                    else:
+                        stmt = (f"INSERT INTO {qs}.{qt} ({', '.join(cnames)}) "
+                                f"VALUES ({', '.join(vals)})")
+                        rc, out, err = run(DA_USER, db, role, stmt)
+                        if rc == 0:
+                            print(page_msg(out or "Row inserted.", ""))
+                        else:
+                            print(page_msg("", err or out or "Insert failed."))
+
+    # --- create table (POST) ---
+    if (params.get("action") or "") == "create_table" and db:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        else:
+            newt = (params.get("new_table") or "").strip().lower()
+            try:
+                qtn = ident(newt)
+            except ValueError:
+                qtn = None
+                print(page_msg("", f"Bad table name '{newt}'."))
+            if qtn:
+                fullt = f"public.{newt}"
+                if fullt in table_names:
+                    print(page_msg("", f"Table '{fullt}' already exists."))
+                else:
+                    defs, pks, bad = [], [], None
+                    for i in range(1, CREATE_ROWS + 1):
+                        cn = (params.get(f"cn{i}") or "").strip().lower()
+                        if not cn:
+                            continue
+                        try:
+                            qc = ident(cn)
+                        except ValueError:
+                            bad = cn
+                            break
+                        ct = (params.get(f"ct{i}") or "text").strip().lower()
+                        if ct not in COL_TYPES:
+                            bad = ct
+                            break
+                        nn = "1" if params.get(f"nn{i}") else "0"
+                        pkf = "1" if params.get(f"pk{i}") else "0"
+                        dv = (params.get(f"cd{i}") or "").strip()
+                        if dv:
+                            if ";" in dv or "--" in dv or "/*" in dv or not re.match(r"^[A-Za-z0-9_ '():.,+*/-]+$", dv):
+                                bad = dv
+                                break
+                        defs.append((cn, ct, nn, dv, pkf))
+                    if bad:
+                        print(page_msg("", f"Bad column/type '{bad}'."))
+                    elif not defs:
+                        print(page_msg("", "Define at least one column."))
+                    else:
+                        spec = "\n".join(f"{c}|{ty}|{nn}|{dv}|{pk}" for c, ty, nn, dv, pk in defs)
+                        rc, out, err = helper_call("ddl", DA_USER, db=db, role=role,
+                                                   extra=["--tbl", fullt, "--header", "create"], ddl=spec)
+                        if rc == 0:
+                            print(page_msg(out or f"Table public.{newt} created.", ""))
+                            tables.append({"name": fullt, "kind": "r", "size": 0, "rows": 0})
+                            table_names.append(fullt)
+                        else:
+                            print(page_msg("", err or out or "Create failed."))
+
+    # --- add column (POST) ---
+    if (params.get("action") or "") == "add_column" and tbl:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif tbl not in table_names:
+            print(page_msg("", f"Unknown table '{tbl}'."))
+        else:
+            try:
+                sch, tab = tbl.split(".", 1)
+                qs, qt = ident(sch), ident(tab)
+            except ValueError:
+                qs = qt = None
+                print(page_msg("", f"Bad table name '{tbl}'."))
+            if qs:
+                cn = (params.get("new_col") or "").strip().lower()
+                ct = (params.get("new_type") or "text").strip().lower()
+                try:
+                    qc = ident(cn)
+                except ValueError:
+                    print(page_msg("", f"Bad column name '{cn}'."))
+                    qc = None
+                if qc:
+                    if ct not in COL_TYPES:
+                        print(page_msg("", f"Bad type '{ct}'."))
+                    else:
+                        nn = "1" if params.get("new_nn") else "0"
+                        dv = (params.get("new_def") or "").strip()
+                        if dv and (";" in dv or "--" in dv or "/*" in dv or not re.match(r"^[A-Za-z0-9_ '():.,+*/-]+$", dv)):
+                            print(page_msg("", f"Bad default '{dv}'."))
+                            qc = None
+                            nn = None
+                        if qc and nn is not None:
+                            spec = f"{cn}|{ct}|{nn}|{dv}|0"
+                            rc, out, err = helper_call("ddl", DA_USER, db=db, role=role,
+                                                       extra=["--tbl", tbl, "--header", "addcol"], ddl=spec)
+                            if rc == 0:
+                                print(page_msg(out or "Column added.", ""))
+                            else:
+                                print(page_msg("", err or out or "Add column failed."))
+
+    # --- drop column (GET + confirm) ---
+    dropcol = (params.get("dropcol") or "").strip().lower()
+    if view == "dropcol" and tbl and dropcol:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif tbl not in table_names:
+            print(page_msg("", f"Unknown table '{tbl}'."))
+        else:
+            try:
+                sch, tab = tbl.split(".", 1)
+                qs, qt = ident(sch), ident(tab)
+                qc = ident(dropcol)
+            except ValueError:
+                qs = None
+                print(page_msg("", "Bad table/column name."))
+            if qs:
+                rc, out, err = run(DA_USER, db, role,
+                                   f"ALTER TABLE {qs}.{qt} DROP COLUMN {qc}")
+                if rc == 0:
+                    print(page_msg(out or "Column dropped.", ""))
+                else:
+                    print(page_msg("", err or out or "Drop column failed."))
+
+    # --- rename table (POST) ---
+    if (params.get("action") or "") == "rename_table" and tbl:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif tbl not in table_names:
+            print(page_msg("", f"Unknown table '{tbl}'."))
+        else:
+            newt = (params.get("new_tname") or "").strip().lower()
+            try:
+                sch, tab = tbl.split(".", 1)
+                qs, qt = ident(sch), ident(tab)
+                qn = ident(newt)
+            except ValueError:
+                qs = None
+                print(page_msg("", "Bad table name."))
+            if qs:
+                rc, out, err = run(DA_USER, db, role,
+                                   f"ALTER TABLE {qs}.{qt} RENAME TO {qn}")
+                if rc == 0:
+                    print(page_msg(out or "Table renamed.", ""))
+                    newfull = f"{sch}.{newt}"
+                    tables = [t if t["name"] != tbl else {**t, "name": newfull} for t in tables]
+                    table_names = [t["name"] for t in tables]
+                    tbl = newfull
+                else:
+                    print(page_msg("", err or out or "Rename failed."))
+
+    # --- update row (POST, ctid-based) ---
+    if (params.get("action") or "") == "update_row":
+        ins_tbl = (params.get("ins_tbl") or "").strip().lower()
+        edit_ctid = (params.get("edit_ctid") or "").strip()
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif not ins_tbl or ins_tbl not in table_names:
+            print(page_msg("", f"Unknown table '{ins_tbl}'."))
+        elif not re.match(r"^\(\d+,\d+\)$", edit_ctid):
+            print(page_msg("", "Bad row id."))
+        else:
+            try:
+                sch, tab = ins_tbl.split(".", 1)
+                qs, qt = ident(sch), ident(tab)
+            except ValueError:
+                qs = qt = None
+                print(page_msg("", f"Bad table name '{ins_tbl}'."))
+            if qs:
+                cs = (f"SELECT column_name FROM information_schema.columns "
+                      f"WHERE table_schema = {lit(sch)} AND table_name = {lit(tab)} "
+                      f"ORDER BY ordinal_position")
+                rc, out, err = run(DA_USER, db, role, cs)
+                if rc != 0:
+                    print(page_msg("", err or out or "Could not read columns."))
+                else:
+                    ccols, crows = parse_tabular(out)
+                    sets, bad = [], None
+                    for r in crows:
+                        if not r:
+                            continue
+                        try:
+                            qc = ident(r[0])
+                        except ValueError:
+                            bad = r[0]
+                            break
+                        v = params.get("col_" + r[0], "")
+                        sets.append(f"{qc} = NULL" if v == "" else f"{qc} = {lit(v)}")
+                    if bad:
+                        print(page_msg("", f"Unsupported column name '{bad}'."))
+                    elif not sets:
+                        print(page_msg("", "Nothing to update."))
+                    else:
+                        # ctid literal safe: strictly validated above
+                        stmt = (f"UPDATE {qs}.{qt} SET {', '.join(sets)} "
+                                f"WHERE ctid = '{edit_ctid}'")
+                        rc, out, err = run(DA_USER, db, role, stmt)
+                        if rc == 0:
+                            print(page_msg(out or "Row updated.", ""))
+                        else:
+                            print(page_msg("", err or out or "Update failed."))
+
+    # --- vacuum / analyze (GET + confirm) ---
+    if view in ("vacuum", "analyze") and tbl:
+        if not role:
+            print(page_msg("", "Pick a role first."))
+        elif tbl not in table_names:
+            print(page_msg("", f"Unknown table '{tbl}'."))
+        else:
+            try:
+                sch, tab = tbl.split(".", 1)
+                qs, qt = ident(sch), ident(tab)
+            except ValueError:
+                qs = None
+                print(page_msg("", f"Bad table name '{tbl}'."))
+            if qs:
+                stmt = (f"VACUUM (ANALYZE) {qs}.{qt}" if view == "vacuum"
+                        else f"ANALYZE {qs}.{qt}")
+                rc, out, err = run(DA_USER, db, role, stmt)
+                if rc == 0:
+                    print(page_msg(out or f"{view} done.", ""))
+                else:
+                    print(page_msg("", err or out or "Failed."))
+
+    # --- import CSV (POST; file must be in ~/pg_backups/) ---
+    if (params.get("action") or "") == "import_csv":
+        imp_tbl = (params.get("imp_tbl") or "").strip().lower()
+        imp_file = (params.get("imp_file") or "").strip()
+        imp_hdr = "yes" if params.get("imp_hdr") else "no"
+        if not imp_tbl or imp_tbl not in table_names:
+            print(page_msg("", f"Unknown table '{imp_tbl}'."))
+        elif not imp_file or imp_file not in csvfiles:
+            print(page_msg("", f"Unknown file '{imp_file}'."))
+        else:
+            rc, out, err = helper_call("import-csv", DA_USER, db=db,
+                                       extra=["--tbl", imp_tbl, "--file", imp_file,
+                                              "--header", imp_hdr])
+            if rc == 0:
+                print(page_msg(out or "Import finished.", ""))
+            else:
+                print(page_msg("", err or out or "Import failed."))
+
+    print(f"<h3>Tables in <code>{e(db)}</code> ({len(tables)})</h3>")
+    if tables:
+        print('<table><tr><th>Table</th><th>Type</th><th>Size</th><th>Rows (est.)</th><th></th></tr>')
+        for t in tables:
+            links = (f'<a href="{SELF}?db={q(db)}&role={q(role)}&tbl={q(t["name"])}&view=struct">Structure</a> | '
+                     f'<a href="{SELF}?db={q(db)}&role={q(role)}&tbl={q(t["name"])}&view=data">Data</a> | '
+                     f'<form method="POST" action="{SELF}" style="display:inline" onsubmit="return confirm(\'Empty table {e(t["name"])} (delete ALL rows)?\')">'
+                     f'<input type="hidden" name="db" value="{e(db)}"><input type="hidden" name="role" value="{e(role)}">'
+                     f'<input type="hidden" name="tbl" value="{e(t["name"])}"><input type="hidden" name="view" value="truncate">'
+                     f'<button type="submit">Empty</button></form> | '
+                     f'<form method="POST" action="{SELF}" style="display:inline" onsubmit="return confirm(\'Drop table {e(t["name"])}?\')">'
+                     f'<input type="hidden" name="db" value="{e(db)}"><input type="hidden" name="role" value="{e(role)}">'
+                     f'<input type="hidden" name="tbl" value="{e(t["name"])}"><input type="hidden" name="view" value="drop">'
+                     f'<button type="submit">Drop</button></form> | '
+                     f'<a href="/CMD_PLUGINS/postgres_manager/export.raw?db={q(db)}&tbl={q(t["name"])}">CSV</a>')
+            print(f'<tr><td><code>{e(t["name"])}</code></td><td>{e(KIND.get(t["kind"], t["kind"]))}</td>'
+                  f'<td>{e(fmt_size(t["size"]))}</td><td>{t["rows"]}</td><td>{links}</td></tr>')
+        print('</table>')
+    else:
+        print("<p>No tables yet.</p>")
+
+    if db and role:
+        print(f'''<div class="box"><h3>Create table in <code>{e(db)}</code> (schema public)</h3>
+<form method="POST" action="{SELF}">
+<input type="hidden" name="action" value="create_table">
+<input type="hidden" name="db" value="{e(db)}">
+<input type="hidden" name="role" value="{e(role)}">
+Table name: <input type="text" name="new_table" maxlength="63" required>
+<table><tr><th>Column</th><th>Type</th><th>NOT NULL</th><th>Default</th><th>PK</th></tr>''')
+        for i in range(1, CREATE_ROWS + 1):
+            opts = "".join(f'<option value="{t}">{t}</option>' for t in COL_TYPES)
+            print(f'<tr><td><input type="text" name="cn{i}" maxlength="63"></td>'
+                  f'<td><select name="ct{i}">{opts}</select></td>'
+                  f'<td><input type="checkbox" name="nn{i}"></td>'
+                  f'<td><input type="text" name="cd{i}" placeholder="e.g. now()"></td>'
+                  f'<td><input type="checkbox" name="pk{i}"></td></tr>')
+        print('''</table>
+<input type="submit" value="Create table">
+<p style="font-size:12px">Empty rows are ignored. DEFAULT is a raw expression.</p>
+</form></div>''')
+
+    if db and tables and csvfiles:
+        print(f'''<div class="box"><h3>Import CSV (server file)</h3>
+<p>Upload a <code>.csv</code> via File Manager/FTP into <code>{e(csvdir)}/</code> first (max 100MB).</p>
+<form method="POST" action="{SELF}">
+<input type="hidden" name="action" value="import_csv">
+<input type="hidden" name="db" value="{e(db)}">
+<input type="hidden" name="role" value="{e(role)}">
+File: <select name="imp_file">''' + "".join(f'<option value="{e(f)}">{e(f)}</option>' for f in csvfiles) + '''</select>
+Table: <select name="imp_tbl">''' + "".join(f'<option value="{e(t["name"])}">{e(t["name"])}</option>' for t in tables) + '''</select>
+<label><input type="checkbox" name="imp_hdr" checked> First row is header</label>
+<input type="submit" value="Import">
+</form>
+<p style="font-size:12px">Columns must match table order. Comma-separated.</p></div>''')
+
+    # --- structure / data / editrow ---
+    if tbl and view in ("struct", "data", "editrow") and role:
+        try:
+            sch, tab = tbl.split(".", 1)
+            qs, qt = ident(sch), ident(tab)
+        except ValueError:
+            print(page_msg("", f"Bad table name '{tbl}'."))
+            sch = tab = None
+        if sch:
+            if view == "struct":
+                s = (f"SELECT column_name AS \"column\", data_type AS type, "
+                     f"is_nullable AS nullable, column_default AS \"default\" "
+                     f"FROM information_schema.columns WHERE table_schema = {lit(sch)} "
+                     f"AND table_name = {lit(tab)} ORDER BY ordinal_position")
+                rc, out, err = run(DA_USER, db, role, s)
+                print(f"<h3>Structure of <code>{e(tbl)}</code></h3>")
+                print(f"<p><form method=\"POST\" action=\"{SELF}\" style=\"display:inline\" onsubmit=\"return confirm('Run VACUUM ANALYZE?')\">"
+                      f"<input type=\"hidden\" name=\"db\" value=\"{e(db)}\"><input type=\"hidden\" name=\"role\" value=\"{e(role)}\"><input type=\"hidden\" name=\"tbl\" value=\"{e(tbl)}\"><input type=\"hidden\" name=\"view\" value=\"vacuum\"><button type=\"submit\">VACUUM</button></form> | "
+                      f"<form method=\"POST\" action=\"{SELF}\" style=\"display:inline\">"
+                      f"<input type=\"hidden\" name=\"db\" value=\"{e(db)}\"><input type=\"hidden\" name=\"role\" value=\"{e(role)}\"><input type=\"hidden\" name=\"tbl\" value=\"{e(tbl)}\"><input type=\"hidden\" name=\"view\" value=\"analyze\"><button type=\"submit\">ANALYZE</button></form> | "
+                      f"<a href=\"/CMD_PLUGINS/postgres_manager/export.raw?db={q(db)}&tbl={q(tbl)}\">Export CSV</a></p>")
+                if rc == 0:
+                    cols, rows = parse_tabular(out)
+                    if cols:
+                        print("<table><tr>" + "".join(f"<th>{e(c)}</th>" for c in cols) + "<th></th></tr>")
+                        for r in rows:
+                            cname = r[0] if r else ""
+                            drop = (f'<form method="POST" action="{SELF}" style="display:inline" onsubmit="return confirm(\'Drop column {e(cname)}?\')">'
+                                    f'<input type="hidden" name="db" value="{e(db)}"><input type="hidden" name="role" value="{e(role)}">'
+                                    f'<input type="hidden" name="tbl" value="{e(tbl)}"><input type="hidden" name="view" value="dropcol">'
+                                    f'<input type="hidden" name="dropcol" value="{e(cname)}"><button type="submit">Drop</button></form>' if cname else "")
+                            print("<tr>" + "".join(f"<td>{e(c)}</td>" for c in r) + f"<td>{drop}</td></tr>")
+                        print("</table>")
+                        print(f'''<div class="box"><h3>Add column</h3>
+<form method="POST" action="{SELF}">
+<input type="hidden" name="action" value="add_column">
+<input type="hidden" name="db" value="{e(db)}">
+<input type="hidden" name="role" value="{e(role)}">
+<input type="hidden" name="tbl" value="{e(tbl)}">
+Name: <input type="text" name="new_col" maxlength="63" required>
+Type: <select name="new_type">''' + "".join(f'<option value="{t}">{t}</option>' for t in COL_TYPES) + '''</select>
+<label><input type="checkbox" name="new_nn"> NOT NULL</label>
+Default: <input type="text" name="new_def" placeholder="e.g. now()">
+<input type="submit" value="Add">
+</form></div>''')
+                        print(f'''<div class="box"><h3>Rename table</h3>
+<form method="POST" action="{SELF}">
+<input type="hidden" name="action" value="rename_table">
+<input type="hidden" name="db" value="{e(db)}">
+<input type="hidden" name="role" value="{e(role)}">
+<input type="hidden" name="tbl" value="{e(tbl)}">
+New name: <input type="text" name="new_tname" maxlength="63" required>
+<input type="submit" value="Rename">
+</form></div>''')
+                    else:
+                        print("<p>(no output)</p>")
+                else:
+                    print(page_msg("", err or out or "Query failed."))
+            else:
+                cs = f"SELECT COUNT(*) AS count FROM {qs}.{qt}"
+                rc, out, err = run(DA_USER, db, role, cs)
+                total = 0
+                if rc == 0:
+                    cols, rows = parse_tabular(out)
+                    try:
+                        total = int(rows[0][0])
+                    except (IndexError, ValueError):
+                        total = 0
+                ds = f"SELECT ctid AS __ctid, * FROM {qs}.{qt} LIMIT {PAGE} OFFSET {off}"
+                rc, out, err = run(DA_USER, db, role, ds)
+                print(f"<h3>Data of <code>{e(tbl)}</code> ({total} rows, showing {off + 1}–{min(off + PAGE, total)})</h3>")
+                if rc == 0:
+                    cols, rows = parse_tabular(out)
+                    if cols and cols[0] == "__ctid":
+                        disp_cols = cols[1:]
+                        ctids = [r[0] if r else "" for r in rows]
+                        disp_rows = [r[1:] for r in rows]
+                    else:
+                        disp_cols, disp_rows = cols, rows
+                        ctids = [""] * len(rows)
+                    if disp_cols:
+                        print("<table><tr>" + "".join(f"<th>{e(c)}</th>" for c in disp_cols) + "<th></th></tr>")
+                        for i, r in enumerate(disp_rows):
+                            cells = "".join(f"<td>{e(c)}</td>" for c in r)
+                            dell = (f'<form method="POST" action="{SELF}" style="display:inline" onsubmit="return confirm(\'Delete this row?\')">'
+                                    f'<input type="hidden" name="db" value="{e(db)}"><input type="hidden" name="role" value="{e(role)}">'
+                                    f'<input type="hidden" name="tbl" value="{e(tbl)}"><input type="hidden" name="view" value="data">'
+                                    f'<input type="hidden" name="off" value="{off}"><input type="hidden" name="del_ctid" value="{e(ctids[i])}">'
+                                    f'<button type="submit">Del</button></form>' if ctids[i] else "")
+                            editl = (f' <a href="{SELF}?db={q(db)}&role={q(role)}&tbl={q(tbl)}&view=editrow&off={off}&edit_ctid={q(ctids[i])}">Edit</a>' if ctids[i] else "")
+                            print(f"<tr>{cells}<td>{dell}{editl}</td></tr>")
+                        print("</table>")
+                    else:
+                        print("<p>(no rows)</p>")
+                    prev_link = (f'<a href="{SELF}?db={q(db)}&role={q(role)}&tbl={q(tbl)}&view=data&off={max(0, off - PAGE)}">← Prev</a>'
+                                 if off > 0 else "← Prev")
+                    next_link = (f'<a href="{SELF}?db={q(db)}&role={q(role)}&tbl={q(tbl)}&view=data&off={off + PAGE}">Next →</a>'
+                                 if off + PAGE < total else "Next →")
+                    print(f"<p>{prev_link} &nbsp; {next_link}</p>")
+                    if disp_cols and role:
+                        print(f'<div class="box"><h3>Insert row</h3>'
+                              f'<form method="POST" action="{SELF}">'
+                              f'<input type="hidden" name="action" value="insert_row">'
+                              f'<input type="hidden" name="db" value="{e(db)}">'
+                              f'<input type="hidden" name="role" value="{e(role)}">'
+                              f'<input type="hidden" name="ins_tbl" value="{e(tbl)}">')
+                        for c in disp_cols:
+                            print(f'{e(c)}: <input type="text" name="col_{e(c)}"><br>')
+                        print('<input type="submit" value="Insert">'
+                              '<p style="font-size:12px">Empty field = NULL. Values are sent as typed literals.</p>'
+                              '</form></div>')
+                    if view == "editrow":
+                        e_ctid = (params.get("edit_ctid") or "").strip()
+                        if e_ctid and re.match(r"^\(\d+,\d+\)$", e_ctid) and disp_cols:
+                            es = f"SELECT * FROM {qs}.{qt} WHERE ctid = '{e_ctid}'"
+                            erc, eout, eerr = run(DA_USER, db, role, es)
+                            if erc == 0:
+                                ecols, erows = parse_tabular(eout)
+                                if erows:
+                                    print(f'<div class="box"><h3>Edit row</h3>'
+                                          f'<form method="POST" action="{SELF}">'
+                                          f'<input type="hidden" name="action" value="update_row">'
+                                          f'<input type="hidden" name="db" value="{e(db)}">'
+                                          f'<input type="hidden" name="role" value="{e(role)}">'
+                                          f'<input type="hidden" name="ins_tbl" value="{e(tbl)}">'
+                                          f'<input type="hidden" name="edit_ctid" value="{e(e_ctid)}">')
+                                    for ci, cn in enumerate(ecols):
+                                        if cn == "__ctid":
+                                            continue
+                                        val = erows[0][ci] if ci < len(erows[0]) else ""
+                                        print(f'{e(cn)}: <input type="text" name="col_{e(cn)}" value="{e(val)}"><br>')
+                                    print('<input type="submit" value="Save">'
+                                          '<p style="font-size:12px">Empty field = NULL.</p>'
+                                          '</form></div>')
+                                else:
+                                    print(page_msg("", "Row not found (it may have moved)."))
+                            else:
+                                print(page_msg("", eerr or eout or "Could not load row."))
+                else:
+                    print(page_msg("", err or out or "Query failed."))
+
+    # --- SQL box ---
+    if role:
+        print(f'''<div class="box"><h3>Run SQL on <code>{e(db)}</code> as <code>{e(role)}</code></h3>
+<form method="POST" action="{SELF}">
+<input type="hidden" name="db" value="{e(db)}">
+<input type="hidden" name="role" value="{e(role)}">
+<textarea name="sql" rows="5" cols="80" placeholder="SELECT * FROM public.mytable;">{e(sql)}</textarea><br>
+<input type="submit" value="Run">
+<button type="submit" name="action" value="explain">Explain</button>
+</form>
+<p style="font-size:12px">Single statement per run. SELECT-like queries get an automatic
+LIMIT 200. Guarded by statement_timeout (15s). Runs with the privileges of the selected role only.</p></div>''')
+        if sql.strip():
+            qtext = sql.strip()
+            if (params.get("action") or "") == "explain":
+                qtext = "EXPLAIN " + qtext
+            rc, out, err = run(DA_USER, db, role, qtext)
+            if rc == 0:
+                if is_select_like(sql):
+                    cols, rows = parse_tabular(out)
+                    trunc = "" if len(rows) < 500 else " (truncated to 500)"
+                    print(f"<h3>Result{trunc}</h3>")
+                    print(result_table(cols, rows, len(rows)) if cols else "<p>(no output)</p>")
+                else:
+                    print(f"<h3>Done</h3><pre>{e(out) if out.strip() else 'OK'}</pre>")
+            else:
+                print(f"<h3>Error</h3><div style='background:#fce8e6;border:1px solid #d93025;padding:8px'>"
+                      f"<pre>{e(err or out or 'Query failed.')}</pre></div>")
+
+    print("</div>")
+
+
+try:
+    main()
+except Exception as ex:
+    try:
+        print(render_crash(ex))
+    except Exception:
+        print('<div>Data Explorer failed. Check DirectAdmin error log.</div>')

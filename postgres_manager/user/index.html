@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""User-level GUI: each DA user manages ONLY its own PostgreSQL DBs/roles."""
+import os
+import stat
+import sys
+sys.path.insert(0, "/usr/local/directadmin/plugins/postgres_manager/scripts")
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+except Exception:
+    pass
+from ui_lib import (e, get_da_user, parse_params, require_post, load_conf, helper_call,
+                    parse_list_output, fmt_size, valid_suffix, page_head,
+                    page_msg, form_style, render_crash, back_link,
+                    pg_read_access)
+
+
+def main():
+    DA_USER = get_da_user()
+    params = parse_params()
+    action = (params.get("action") or "").strip()
+    ok_msg, err_msg = "", ""
+
+    conf = load_conf()
+
+    # --- handle POST actions (stay on same page, show message) ---
+    _MUT = {"create_db", "drop_db", "create_role", "drop_role",
+            "change_password", "grant", "revoke", "restore"}
+    if action and action in _MUT and not require_post():
+        ok_msg, err_msg = "", "This action requires POST."
+        action = ""
+    if action in ("create_db", "drop_db", "create_role", "drop_role",
+                  "change_password", "grant", "revoke", "restore"):
+        db = (params.get("db") or "").strip().lower()
+        role = (params.get("role") or "").strip().lower()
+        bfile = (params.get("file") or "").strip()
+        pw = params.get("password") or ""
+        pw2 = params.get("password2") or ""
+        try:
+            if action == "create_db":
+                if not valid_suffix(db):
+                    err_msg = "Invalid database short name (a-z, 0-9, _, start with letter, max 31 chars)."
+                else:
+                    rc, out, err = helper_call("create-db", DA_USER, db=db)
+                    if rc == 0:
+                        ok_msg = out or "Database created."
+                    else:
+                        err_msg = err or out or "Create database failed."
+            elif action == "drop_db":
+                rc, out, err = helper_call("drop-db", DA_USER, db=db)
+                if rc == 0:
+                    ok_msg = out or "Database dropped."
+                else:
+                    err_msg = err or out or "Drop database failed."
+            elif action == "create_role":
+                if not valid_suffix(role):
+                    err_msg = "Invalid user short name (a-z, 0-9, _, start with letter, max 31 chars)."
+                elif len(pw) < 8:
+                    err_msg = "Password must be at least 8 characters."
+                elif pw != pw2:
+                    err_msg = "Passwords do not match."
+                else:
+                    rc, out, err = helper_call("create-role", DA_USER, role=role, password=pw)
+                    if rc == 0:
+                        ok_msg = out or "DB user created."
+                    else:
+                        err_msg = err or out or "Create user failed."
+            elif action == "drop_role":
+                rc, out, err = helper_call("drop-role", DA_USER, role=role)
+                if rc == 0:
+                    ok_msg = out or "DB user dropped."
+                else:
+                    err_msg = err or out or "Drop user failed."
+            elif action == "change_password":
+                if len(pw) < 8:
+                    err_msg = "Password must be at least 8 characters."
+                elif pw != pw2:
+                    err_msg = "Passwords do not match."
+                else:
+                    rc, out, err = helper_call("passwd", DA_USER, role=role, password=pw)
+                    if rc == 0:
+                        ok_msg = out or "Password changed."
+                    else:
+                        err_msg = err or out or "Password change failed."
+            elif action == "grant":
+                rc, out, err = helper_call("grant", DA_USER, db=db, role=role)
+                if rc == 0:
+                    ok_msg = out or "Access granted."
+                else:
+                    err_msg = err or out or "Grant failed."
+            elif action == "restore":
+                if not db:
+                    err_msg = "Pick a database."
+                elif not bfile:
+                    err_msg = "Pick a backup file."
+                else:
+                    rc, out, err = helper_call("restore", DA_USER, db=db, filename=bfile)
+                    if rc == 0:
+                        ok_msg = (out or "Restore finished.")[-2000:]
+                    else:
+                        err_msg = (err or out or "Restore failed.")[-2000:]
+            elif action == "revoke":
+                rc, out, err = helper_call("revoke", DA_USER, db=db, role=role)
+                if rc == 0:
+                    ok_msg = out or "Access revoked."
+                else:
+                    err_msg = err or out or "Revoke failed."
+        except Exception as ex:
+            err_msg = f"Unexpected error: {ex}"
+
+    # --- current state ---
+    rc, out, err = helper_call("ensure-user", DA_USER)
+    if rc != 0:
+        if not err_msg:
+            err_msg = err or "Could not initialize your PostgreSQL owner role. Contact admin."
+    rc, out, err = helper_call("list", DA_USER)
+    data = parse_list_output(out) if rc == 0 else {"prefix": "", "dbs": [], "roles": []}
+    if rc != 0 and not err_msg and not ok_msg:
+        err_msg = err or "Could not list databases (is PostgreSQL running?)."
+
+    prefix = data["prefix"]
+    dbs = data["dbs"]
+    roles = data["roles"]
+    login_roles = [r for r in roles if r["name"] != prefix]
+
+    # --- render (fragment; DA skin wraps it) ---
+    print(page_head(f"PostgreSQL Manager — {DA_USER}"))
+    print(form_style())
+    print('<div class="pg">')
+    print(back_link())
+    print(page_msg(ok_msg, err_msg))
+
+    print(f"""<div class="box">
+<b>Your prefix:</b> <code>{e(prefix)}</code> &nbsp;
+All database / user names start with this prefix, so accounts are fully isolated from each other.<br>
+<b>Server:</b> <code>{e(conf.get('PGHOST',''))}:{e(conf.get('PGPORT',''))}</code><br>
+Short names you type (e.g. <code>shop</code>) become full names like <code>{e(prefix + '_shop' if prefix else 'da_user_shop')}</code>.
+</div>""")
+
+    # create forms
+    print("""<div class="box"><h3>Create database</h3>
+<form method="POST" action="/CMD_PLUGINS/postgres_manager">
+<input type="hidden" name="action" value="create_db">
+Short name: <input type="text" name="db" maxlength="31" placeholder="e.g. shop" required>
+<input type="submit" value="Create">
+</form></div>""")
+
+    print("""<div class="box"><h3>Create DB user</h3>
+<form method="POST" action="/CMD_PLUGINS/postgres_manager">
+<input type="hidden" name="action" value="create_role">
+Short name: <input type="text" name="role" maxlength="31" placeholder="e.g. app" required>
+Password: <input type="password" name="password" required>
+Confirm: <input type="password" name="password2" required>
+<input type="submit" value="Create user">
+</form>
+<p style="font-size:12px">Min 8 chars. Each user is a LOGIN role, member of your owner group.</p></div>""")
+
+    # databases table
+    print("<h3>Databases (%d)</h3>" % len(dbs))
+    if dbs:
+        print('<table><tr><th>Database</th><th>Owner</th><th>Size</th><th>Browse</th><th>Drop</th></tr>')
+    for d in dbs:
+        print(f'<tr><td><code>{e(d["name"])}</code></td><td><code>{e(d["owner"])}</code></td>'
+              f'<td>{e(fmt_size(d["size"]))}</td>'
+              f'<td><a href="/CMD_PLUGINS/postgres_manager/browse.html?db={e(d["name"])}">Browse</a> | <a href="/CMD_PLUGINS/postgres_manager/download.raw?db={e(d["name"])}">SQL</a></td>'
+              f'<td><form method="POST" action="/CMD_PLUGINS/postgres_manager" onsubmit="return confirm(\'Drop database {e(d["name"])}?\')">'
+              f'<input type="hidden" name="action" value="drop_db">'
+              f'<input type="hidden" name="db" value="{e(d["name"])}">'
+              f'<input type="submit" value="Drop"></form></td></tr>')
+        print('</table>')
+    else:
+        print("<p>No databases yet.</p>")
+
+    # roles table
+    print("<h3>DB users (%d)</h3>" % len(login_roles))
+    if login_roles:
+        print('<table><tr><th>User</th><th>Mode</th><th>New password</th><th>Drop</th></tr>')
+        for r in login_roles:
+            print(f'<tr><td><code>{e(r["name"])}</code></td><td>{e(r["mode"])}</td>'
+                  f'<td><form method="POST" action="/CMD_PLUGINS/postgres_manager">'
+                  f'<input type="hidden" name="action" value="change_password">'
+                  f'<input type="hidden" name="role" value="{e(r["name"])}">'
+                  f'<input type="password" name="password" placeholder="new password" required style="width:130px"> '
+                  f'<input type="password" name="password2" placeholder="confirm" required style="width:130px"> '
+                  f'<input type="submit" value="Set"></form></td>'
+                  f'<td><form method="POST" action="/CMD_PLUGINS/postgres_manager" onsubmit="return confirm(\'Drop user {e(r["name"])}?\')">'
+                  f'<input type="hidden" name="action" value="drop_role">'
+                  f'<input type="hidden" name="role" value="{e(r["name"])}">'
+                  f'<input type="submit" value="Drop"></form></td></tr>')
+        print('</table>')
+    else:
+        print("<p>No DB users yet.</p>")
+
+    # grant/revoke
+    if dbs and login_roles:
+        print("""<div class="box"><h3>Grant / revoke access</h3>
+<form method="POST" action="/CMD_PLUGINS/postgres_manager">User:
+<select name="role">""")
+        for r in login_roles:
+            print(f'<option value="{e(r["name"])}">{e(r["name"])}</option>')
+        print('</select> Database: <select name="db">')
+        for d in dbs:
+            print(f'<option value="{e(d["name"])}">{e(d["name"])}</option>')
+        print("""</select>
+<button type="submit" name="action" value="grant">Grant</button>
+<button type="submit" name="action" value="revoke">Revoke</button>
+</form>
+<p style="font-size:12px">Grant gives CONNECT + schema usage on that database only (still inside your prefix).</p></div>""")
+
+    # --- backup & restore ---
+    home = os.environ.get("HOME") or f"/home/{DA_USER}"
+    bdir = os.path.join(home, "pg_backups")
+    try:
+        # postgres (restore runner) must traverse this dir; enforce on every
+        # page load so File Manager uploads with tight perms don't break it
+        os.makedirs(bdir, mode=0o755, exist_ok=True)
+        os.chmod(bdir, 0o755)
+    except OSError:
+        pass
+    bfiles = []
+    try:
+        for f in sorted(os.listdir(bdir)):
+            fp = os.path.join(bdir, f)
+            if f.endswith(".sql") and os.path.isfile(fp):
+                bfiles.append((f, os.path.getsize(fp)))
+    except OSError:
+        pass
+    print(f"""<div class="box"><h3>Backup &amp; restore</h3>
+<p>Download a dump any time with the <b>SQL</b> link next to each database above
+(plain format, --no-owner --clean).</p>
+<p>To restore: upload a <code>.sql</code> file via File Manager/FTP into
+<code>{e(bdir)}/</code>, then pick it below.</p>""")
+    if bfiles and dbs:
+        print(f"""<form method="POST" action="/CMD_PLUGINS/postgres_manager">
+<input type="hidden" name="action" value="restore">
+File: <select name="file">""")
+        for f, sz in bfiles:
+            print(f'<option value="{e(f)}">{e(f)} ({e(fmt_size(sz))})</option>')
+        print('</select> Database: <select name="db">')
+        for d in dbs:
+            print(f'<option value="{e(d["name"])}">{e(d["name"])}</option>')
+        print("""</select>
+<input type="submit" value="Restore" onclick="return confirm('Restore into the selected database?')">
+</form>""")
+    else:
+        print("<p>No backup files and/or no databases yet.</p>")
+    print("""<p style="font-size:12px">Max 100MB per file (larger: restore via SSH psql).
+Runs as the account owner role; per-statement errors are reported, not fatal.</p></div>""")
+    import stat as _stat
+    _warn = []
+    _ok, _why = pg_read_access(home, _stat.S_IXOTH)
+    if not _ok:
+        _warn.append((f"home dir not traversable by postgres ({_why})", f"chmod 711 {home}"))
+    _ok, _why = pg_read_access(bdir, _stat.S_IROTH | _stat.S_IXOTH)
+    if not _ok:
+        _warn.append((f"backup dir not readable by postgres ({_why})", f"chmod 755 {bdir}"))
+    for _f, _sz in bfiles:
+        _ok, _why = pg_read_access(os.path.join(bdir, _f), _stat.S_IROTH)
+        if not _ok:
+            _warn.append((f"file {_f} not readable by postgres ({_why})",
+                          f"chmod 644 {os.path.join(bdir, _f)}"))
+            break
+    if _warn:
+        print('<div style="background:#fff8e1;border:1px solid #f9ab00;padding:8px;margin:8px 0">'
+              '<b>Restore will fail until permissions are fixed:</b><br>'
+              + "<br>".join(f"{e(t)} — admin fix: <code>{e(c)}</code>" for t, c in _warn) + "</div>")
+
+    # connection info
+    print(f"""<div class="box"><h3>Connect</h3>
+<p>Host: <code>{e(conf.get('PGHOST',''))}</code> &nbsp; Port: <code>{e(conf.get('PGPORT',''))}</code></p>
+<p>Example:</p>
+<p><code>psql -h {e(conf.get('PGHOST',''))} -p {e(conf.get('PGPORT',''))} -U FULL_USER_NAME -d FULL_DB_NAME</code></p>
+<p style="font-size:12px">Use the <b>full</b> user/database names shown above with the password you set. Local socket path is used on this server; for remote app servers use the server IP and open port 5432 for your IP in the firewall + pg_hba.conf.</p>
+</div>""")
+
+    print("</div>")
+
+
+try:
+    main()
+except Exception as ex:
+    try:
+        print(render_crash(ex))
+    except Exception:
+        print('<div>PostgreSQL Manager failed. Check DirectAdmin error log.</div>')

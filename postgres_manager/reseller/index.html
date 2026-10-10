@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Reseller GUI: overview of owned users' PostgreSQL usage (read-only counts)."""
+import os
+import sys
+sys.path.insert(0, "/usr/local/directadmin/plugins/postgres_manager/scripts")
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+except Exception:
+    pass
+from ui_lib import (e, get_da_user, load_conf, helper_call, parse_stats_output, da_prefix, get_role_prefix,
+                    fmt_size, page_head, form_style, render_crash, back_link)
+
+
+def main():
+    RESELLER = get_da_user()
+    conf = load_conf()
+
+    owned = []
+    rc_u, out_u, err_u = helper_call("da-users", RESELLER, as_root=True)
+    if rc_u == 0:
+        owned = [l.strip() for l in out_u.splitlines() if l.strip()]
+
+    role_prefix = get_role_prefix()
+    prefix_to_user = {da_prefix(u, role_prefix): u for u in owned}
+    dbs, roles = [], []
+    rc_s, out_s, err_s = helper_call("stats", RESELLER, as_root=True)
+    if rc_s == 0:
+        dbs, roles = parse_stats_output(out_s)
+    per = {u: {"ndb": 0, "nrole": 0, "size": 0} for u in owned}
+    for d in dbs:
+        u = None
+        if d["owner"] in prefix_to_user:
+            u = prefix_to_user[d["owner"]]
+        else:
+            for prfx, uu in prefix_to_user.items():
+                if d["name"].startswith(prfx + "_"):
+                    u = uu
+                    break
+        if u in per:
+            per[u]["ndb"] += 1
+            per[u]["size"] += d["size"]
+    for r in roles:
+        for prfx, uu in prefix_to_user.items():
+            if r["name"] == prfx or r["name"].startswith(prfx + "_"):
+                if r["name"] != prfx and uu in per:
+                    per[uu]["nrole"] += 1
+                break
+    rows = [{"user": u, "ndb": per[u]["ndb"], "nrole": per[u]["nrole"],
+             "size": per[u]["size"], "err": "" if rc_s == 0 else (err_s or out_s)} for u in sorted(owned)]
+
+    print(page_head(f"PostgreSQL Manager — Reseller {RESELLER}"))
+    print(form_style())
+    print('<div class="pg">')
+    print(back_link())
+    print(f'<div class="box">Server: <code>{e(conf.get("PGHOST",""))}:{e(conf.get("PGPORT",""))}</code>. '
+          'Each of your users manages their own databases via <i>PostgreSQL Manager</i> in their panel; names are isolated by prefix.</div>')
+    print(f"<h3>Your users ({len(rows)})</h3>")
+    if rows:
+        print('<table><tr><th>User</th><th>DBs</th><th>Roles</th><th>Total size</th></tr>')
+        for r in rows:
+            print(f'<tr><td><code>{e(r["user"])}</code></td><td>{e(r["ndb"])}</td><td>{e(r["nrole"])}</td><td>{e(fmt_size(r["size"]))}</td></tr>')
+        print('</table>')
+    else:
+        print("<p>No users found under this reseller (or users.list unavailable).</p>")
+    print("</div>")
+
+
+try:
+    main()
+except Exception as ex:
+    try:
+        print(render_crash(ex))
+    except Exception:
+        print('<div>PostgreSQL Manager failed. Check DirectAdmin error log.</div>')

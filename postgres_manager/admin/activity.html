@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Admin live activity: sessions, DB sizes, locks. Admin-only."""
+import os
+import sys
+sys.path.insert(0, "/usr/local/directadmin/plugins/postgres_manager/scripts")
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+except Exception:
+    pass
+from ui_lib import (e, get_da_user, parse_params, require_post, helper_call, fmt_size,
+                    page_head, page_msg, form_style, render_crash, back_link)
+
+
+def main():
+    ADMIN = get_da_user()
+    params = parse_params()
+    ok_msg, err_msg = "", ""
+    kill_pid = (params.get("kill_pid") or "").strip()
+    if kill_pid and not require_post():
+        ok_msg, err_msg = "", "Killing a session requires POST."
+        kill_pid = ""
+    if kill_pid:
+        import re as _re
+        if not _re.match(r"^[0-9]+$", kill_pid):
+            err_msg = "Bad pid."
+        else:
+            rc, out, err = helper_call("kill-session", ADMIN, as_root=True, extra=["--pid", kill_pid])
+            res = (out or "").strip().splitlines()
+            res = res[-1] if res else ""
+            if rc == 0 and res == "killed":
+                ok_msg = f"Session {kill_pid} terminated."
+            elif rc == 0 and res == "self":
+                err_msg = "Refused: that is the helper's own session."
+            else:
+                err_msg = err or out or "Kill failed."
+
+    sessions, sizes, locks = [], [], []
+    section = None
+    rc, out, err = helper_call("activity", ADMIN, as_root=True)
+    if rc == 0:
+        for line in out.splitlines():
+            s = line.strip()
+            if s == "---SESSIONS---":
+                section = "s"
+            elif s == "---DBSIZES---":
+                section = "d"
+            elif s == "---LOCKS---":
+                section = "l"
+            elif not s:
+                continue
+            elif section == "s":
+                p = s.split("|")
+                if len(p) >= 6:
+                    try:
+                        secs = int(float(p[4]))
+                    except ValueError:
+                        secs = 0
+                    sessions.append({"pid": p[0], "user": p[1], "db": p[2],
+                                     "state": p[3], "secs": secs, "query": p[5]})
+            elif section == "d":
+                p = s.split("|")
+                if len(p) >= 2:
+                    try:
+                        sz = int(p[1])
+                    except ValueError:
+                        sz = 0
+                    sizes.append({"db": p[0], "size": sz})
+            elif section == "l":
+                p = s.split("|")
+                if len(p) >= 2:
+                    locks.append({"mode": p[0], "count": p[1]})
+    elif not err_msg:
+        err_msg = err or "Could not load activity."
+
+    print(page_head("Live Activity — Admin"))
+    print(form_style())
+    print('<div class="pg">')
+    print(back_link())
+    print(page_msg(ok_msg, err_msg))
+    print(f"<h3>Sessions ({len(sessions)})</h3>")
+    if sessions:
+        print('<table><tr><th>PID</th><th>User</th><th>DB</th><th>State</th>'
+              '<th>Duration</th><th>Query</th><th></th></tr>')
+        for x in sessions:
+            print(f'<tr><td><code>{e(x["pid"])}</code></td><td><code>{e(x["user"])}</code></td>'
+                  f'<td><code>{e(x["db"])}</code></td><td>{e(x["state"])}</td>'
+                  f'<td>{e(x["secs"])}s</td><td><code>{e(x["query"])}</code></td>'
+                  f'<td><form method="POST" action="/CMD_PLUGINS_ADMIN/postgres_manager/activity.html" style="display:inline">'
+                  f'<input type="hidden" name="kill_pid" value="{e(x["pid"])}">'
+                  f'<button type="submit" onclick="return confirm(\'Kill session {e(x["pid"])}?\')">Kill</button></form></td></tr>')
+        print('</table>')
+    else:
+        print("<p>No active sessions.</p>")
+    print(f"<h3>Database sizes</h3>")
+    if sizes:
+        print('<table><tr><th>Database</th><th>Size</th></tr>')
+        for x in sizes:
+            print(f'<tr><td><code>{e(x["db"])}</code></td><td>{e(fmt_size(x["size"]))}</td></tr>')
+        print('</table>')
+    print(f"<h3>Locks by mode</h3>")
+    if locks:
+        print('<table><tr><th>Mode</th><th>Count</th></tr>')
+        for x in locks:
+            print(f'<tr><td><code>{e(x["mode"])}</code></td><td>{e(x["count"])}</td></tr>')
+        print('</table>')
+    else:
+        print("<p>No locks held.</p>")
+    print("</div>")
+
+
+try:
+    main()
+except Exception as ex:
+    try:
+        print(render_crash(ex))
+    except Exception:
+        print('<div>Activity page failed. Check DirectAdmin error log.</div>')

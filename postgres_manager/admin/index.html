@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Admin GUI: server status + per-DA-user overview and maintenance.
+
+Uses a single privileged 'stats' query (no per-user round-trips) so the
+page stays fast on servers with many accounts.
+"""
+import os
+import re
+import sys
+sys.path.insert(0, "/usr/local/directadmin/plugins/postgres_manager/scripts")
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+except Exception:
+    pass
+from ui_lib import (e, get_da_user, parse_params, require_post, load_conf, helper_call,
+                    parse_stats_output, da_prefix, get_role_prefix, fmt_size,
+                    page_head, page_msg, form_style, render_crash, back_link)
+
+
+def main():
+    ADMIN = get_da_user()
+    params = parse_params()
+    action = (params.get("action") or "").strip()
+    target = (params.get("target") or "").strip()
+    ok_msg, err_msg = "", ""
+    conf = load_conf()
+
+    if action in ("set_prefix", "ensure", "suspend", "activate", "drop_user", "pg_install") and not require_post():
+        err_msg = "This action requires POST."
+        action = ""
+    if action == "pg_install":
+        rc, out, err = helper_call("pg-install", ADMIN, as_root=True)
+        if rc == 0:
+            ok_msg = out
+        else:
+            err_msg = err or out or "Install failed."
+    if action == "set_prefix":
+        new = (params.get("new_prefix") or params.get("prefix") or "").strip().lower()
+        if not re.match(r"^[a-z][a-z0-9_]{0,7}$", new):
+            err_msg = ("Invalid prefix (1-8 chars: a-z, 0-9, _, start with a letter; "
+                       "recommended: keep 'da_').")
+        else:
+            rc, out, err = helper_call("set-prefix", prefix=new, as_root=True)
+            if rc == 0:
+                ok_msg = out
+            else:
+                err_msg = err or out or "Prefix change failed."
+
+    if action in ("ensure", "suspend", "activate", "drop_user") and target:
+        haction = {"ensure": "ensure-user", "suspend": "suspend",
+                   "activate": "activate", "drop_user": "drop-user"}[action]
+        rc, out, err = helper_call(haction, target, as_root=True)
+        if rc == 0:
+            ok_msg = out
+        else:
+            err_msg = err or out or "Action failed."
+
+    # server test (helper runs as root here, psql as postgres inside)
+    rc_t, out_t, err_t = helper_call("test", ADMIN, as_root=True)
+
+    # DA users via helper (the panel unix user cannot list DA data dir)
+    da_users = []
+    rc_u, out_u, err_u = helper_call("da-users", ADMIN, as_root=True)
+    if rc_u == 0:
+        da_users = sorted(l.strip() for l in out_u.splitlines() if l.strip())
+    elif not err_msg and not ok_msg:
+        err_msg = err_u or "Could not list DA users."
+
+    # one server-wide stats query, then group by prefix locally
+    role_prefix = get_role_prefix()
+    prefix_to_user = {da_prefix(u, role_prefix): u for u in da_users}
+    dbs, roles = [], []
+    rc_s, out_s, err_s = helper_call("stats", ADMIN, as_root=True)
+    if rc_s == 0:
+        dbs, roles = parse_stats_output(out_s)
+    elif not err_msg and not ok_msg:
+        err_msg = err_s or "Could not load PostgreSQL stats."
+
+    per = {u: {"prefix": da_prefix(u, role_prefix), "ndb": 0, "nrole": 0, "size": 0} for u in da_users}
+
+    def owner_of_db(name, owner):
+        if owner in prefix_to_user:
+            return prefix_to_user[owner]
+        for p, u in prefix_to_user.items():
+            if name.startswith(p + "_"):
+                return u
+        return None
+
+    for d in dbs:
+        u = owner_of_db(d["name"], d["owner"])
+        if u in per:
+            per[u]["ndb"] += 1
+            per[u]["size"] += d["size"]
+
+    for r in roles:
+        for p, u in prefix_to_user.items():
+            if r["name"] == p or r["name"].startswith(p + "_"):
+                if r["name"] != p:
+                    per[u]["nrole"] += 1
+                break
+
+    rows = [{"user": u, **per[u]} for u in da_users]
+
+    print(page_head("PostgreSQL Manager — Admin"))
+    print(form_style())
+    print('<div class="pg">')
+    print(back_link())
+    print(page_msg(ok_msg, err_msg))
+    print(f"""<div class="box"><b>Server:</b> <code>{e(conf.get('PGHOST',''))}:{e(conf.get('PGPORT',''))}</code>
+as <code>{e(conf.get('PGUSER',''))}</code><br>""")
+    if rc_t == 0:
+        print(f'<span style="color:green">Connection OK</span> — {e(out_t)}')
+    else:
+        print(f'<span style="color:red">Connection FAILED</span> — {e(err_t or out_t)}')
+    print("""<br><span style="font-size:12px">Isolation: each DA user owns prefix
+<code>da_&lt;user&gt;_*</code>. Config:
+<code>/usr/local/directadmin/plugins/postgres_manager/conf/pg.conf</code></span></div>""")
+
+    print(f"""<div class="box"><h3>Settings — object prefix</h3>
+<p>Current prefix: <code>{e(role_prefix)}</code> &nbsp; Example: DA user <code>admin</code>
+&rarr; owner role <code>{e(da_prefix('admin', role_prefix))}</code></p>
+<form method="POST" action="/CMD_PLUGINS_ADMIN/postgres_manager">
+<input type="hidden" name="action" value="set_prefix">
+New prefix: <input type="text" name="new_prefix" maxlength="8" value="{e(role_prefix)}" required>
+<input type="submit" value="Change prefix">
+</form>
+<p style="font-size:12px;color:#b06000"><b>Warning:</b> changing the prefix does NOT rename
+existing databases/roles — objects created with the old prefix become invisible to the
+plugin (orphaned). Only change this before users create anything, or plan a manual rename.
+Recommended to keep <code>da_</code>.</p></div>""")
+
+    # --- prerequisites (binaries + install button) ---
+    rc_p, out_p, err_p = helper_call("prereqs", ADMIN, as_root=True)
+    print('<div class="box"><h3>Prerequisites</h3>')
+    if rc_p != 0:
+        print(page_msg("", err_p or out_p or "Could not check prerequisites."))
+    else:
+        bins, rest = [], []
+        in_rest = False
+        for line in out_p.splitlines():
+            ls = line.strip()
+            if ls.startswith("---"):
+                in_rest = True
+                rest.append(ls)
+            elif not in_rest and "=" in ls:
+                bins.append(ls)
+            else:
+                rest.append(line.rstrip())
+        print('<table><tr><th>Component</th><th>Status</th></tr>')
+        for ls in bins:
+            k, v = ls.split("=", 1)
+            good = "missing" not in v and "FAILED" not in v and "not installed" not in v
+            col = "green" if good else "red"
+            print(f"<tr><td><code>{e(k)}</code></td><td style='color:{col}'>{e(v)}</td></tr>")
+        print('</table>')
+        if rest:
+            print("<pre>" + e("\n".join(rest)) + "</pre>")
+        if "missing" in out_p and "pkgmgr=apt" in out_p:
+            print('<form method="POST" action="/CMD_PLUGINS_ADMIN/postgres_manager" '
+                  'onsubmit="return confirm(\'Install PostgreSQL via apt (may take a few minutes)?\')">'
+                  '<input type="hidden" name="action" value="pg_install">'
+                  '<input type="submit" value="Install PostgreSQL (apt)">'
+                  '</form><p style="font-size:12px">Debian/Ubuntu only: runs '
+                  '<code>apt-get update && apt-get install -y postgresql sudo python3</code> as root.</p>')
+        elif "missing" in out_p:
+            print('<p style="color:#b06000">Automatic install is only supported on Debian/Ubuntu (apt). '
+                  'On RHEL/Alma/Rocky run as root: <code>dnf install -y postgresql-server sudo python3 && '
+                  'postgresql-setup --initdb && systemctl enable --now postgresql</code></p>')
+    print('</div>')
+    # --- server checks (auth config that app logins depend on) ---
+    settings, hba = {}, []
+    section = None
+    rc_sc, out_sc, err_sc = helper_call("server-checks", ADMIN, as_root=True)
+    if rc_sc == 0:
+        for line in out_sc.splitlines():
+            s = line.strip()
+            if s == "---SETTINGS---":
+                section = "s"
+            elif s == "---HBA---":
+                section = "h"
+            elif s and section == "s" and "=" in s:
+                k, v = s.split("=", 1)
+                settings[k.strip()] = v.strip()
+            elif section == "h":
+                hba.append(line.rstrip())
+    print('<div class="box"><h3>Server checks</h3>')
+    if rc_sc != 0:
+        print(page_msg("", err_sc or "Could not load server checks."))
+    else:
+        print('<table><tr><th>Setting</th><th>Value</th></tr>')
+        for k in ("server_version", "port", "listen_addresses", "ssl",
+                  "password_encryption", "max_connections"):
+            if k in settings:
+                print(f"<tr><td><code>{e(k)}</code></td><td><code>{e(settings[k])}</code></td></tr>")
+        print("</table>")
+        enc = settings.get("password_encryption", "")
+        if enc == "scram-sha-256":
+            print('<p><span style="color:green">OK</span> password_encryption = scram-sha-256 — app logins with passwords work.</p>')
+        elif enc:
+            print(f'<p><span style="color:red">WARNING</span> password_encryption = {e(enc)} — '
+                  'passwords are stored in old format and fail scram logins. '
+                  'Set scram-sha-256 in postgresql.conf, reload, then reset all role passwords.</p>')
+        bad_ident = [l for l in hba if re.match(r"\s*host\s+\S+\s+\S+\s+(127\.0\.0\.1/32|::1/128)\s+ident\b", l)]
+        if bad_ident:
+            print('<p><span style="color:red">WARNING</span> TCP localhost still uses ident — '
+                  'app-code logins will fail. Change to scram-sha-256 in pg_hba.conf + reload.</p>')
+        elif any(re.match(r"\s*host\b", l) for l in hba):
+            print('<p><span style="color:green">OK</span> TCP rules use password auth.</p>')
+        print("<h4>pg_hba.conf (active rules)</h4><pre>" + e("\n".join(hba)) + "</pre>")
+    print("</div>")
+
+    print('<p><a href="/CMD_PLUGINS_ADMIN/postgres_manager/activity.html">Live activity (sessions, sizes, locks) →</a></p>')
+    print(f"<h3>Users ({len(rows)})</h3>")
+    print('<table><tr><th>DA user</th><th>Prefix</th><th>DBs</th><th>Roles</th><th>Total size</th><th>Actions</th></tr>')
+    for r in rows:
+        u = r["user"]
+        print(f'<tr><td><code>{e(u)}</code></td><td><code>{e(r["prefix"])}</code></td>'
+              f'<td>{e(r["ndb"])}</td><td>{e(r["nrole"])}</td><td>{e(fmt_size(r["size"]))}</td><td>'
+              f'<form method="POST" action="/CMD_PLUGINS_ADMIN/postgres_manager" style="display:inline">'
+              f'<input type="hidden" name="target" value="{e(u)}">'
+              f'<button type="submit" name="action" value="ensure">Ensure</button> '
+              f'<button type="submit" name="action" value="suspend">Suspend</button> '
+              f'<button type="submit" name="action" value="activate">Activate</button> '
+              f'<button type="submit" name="action" value="drop_user" onclick="return confirm(\'Delete ALL PG data of {e(u)}?\')">Drop all</button>'
+              f'</form></td></tr>')
+    print('</table>')
+    print('<p style="font-size:12px">Hooks auto-create the owner role on user creation and wipe PG objects on user deletion; suspend/unsuspend toggles NOLOGIN/LOGIN.</p>')
+    print("</div>")
+
+
+try:
+    main()
+except Exception as ex:
+    try:
+        print(render_crash(ex))
+    except Exception:
+        print('<div>PostgreSQL Manager failed. Check DirectAdmin error log.</div>')
