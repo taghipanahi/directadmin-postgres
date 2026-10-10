@@ -135,37 +135,86 @@ Recommended to keep <code>da_</code>.</p></div>""")
     if rc_p != 0:
         print(page_msg("", err_p or out_p or "Could not check prerequisites."))
     else:
-        bins, rest = [], []
-        in_rest = False
+        # Parse structured output: sections ---OS---, ---CLUSTER---, ---CONNECT---
+        sections = {"OS": [], "CLUSTER": [], "CONNECT": []}
+        current = None
         for line in out_p.splitlines():
             ls = line.strip()
-            if ls.startswith("---"):
-                in_rest = True
-                rest.append(ls)
-            elif not in_rest and "=" in ls:
-                bins.append(ls)
+            if ls == "---OS---":
+                current = "OS"
+            elif ls == "---CLUSTER---":
+                current = "CLUSTER"
+            elif ls == "---CONNECT---":
+                current = "CONNECT"
+            elif current:
+                sections[current].append(line.rstrip())
+
+        # OS section: key=value pairs + pkgmgr
+        os_kv = []
+        for ln in sections["OS"]:
+            if "=" in ln and not ln.startswith("---"):
+                k, v = ln.split("=", 1)
+                os_kv.append((k.strip(), v.strip()))
+        if os_kv:
+            print('<h4>OS</h4><table><tr><th>Key</th><th>Value</th></tr>')
+            for k, v in os_kv:
+                print(f"<tr><td><code>{e(k)}</code></td><td>{e(v)}</td></tr>")
+            print('</table>')
+
+        # CLUSTER section
+        if sections["CLUSTER"]:
+            print('<h4>Cluster</h4><pre>' + e("\n".join(sections["CLUSTER"])) + '</pre>')
+
+        # CONNECT section: show version nicely
+        if sections["CONNECT"]:
+            conn = "\n".join(sections["CONNECT"]).strip()
+            # Extract version line
+            ver_line = ""
+            for ln in sections["CONNECT"]:
+                if "PostgreSQL" in ln and "version" not in ln.lower():
+                    ver_line = ln.strip()
+                    break
+            if ver_line:
+                print('<h4>Connection</h4><p style="color:green"><b>OK</b> — ' + e(ver_line) + '</p>')
             else:
-                rest.append(line.rstrip())
-        print('<table><tr><th>Component</th><th>Status</th></tr>')
-        for ls in bins:
-            k, v = ls.split("=", 1)
-            good = "missing" not in v and "FAILED" not in v and "not installed" not in v
-            col = "green" if good else "red"
-            print(f"<tr><td><code>{e(k)}</code></td><td style='color:{col}'>{e(v)}</td></tr>")
-        print('</table>')
-        if rest:
-            print("<pre>" + e("\n".join(rest)) + "</pre>")
-        if "missing" in out_p and "pkgmgr=apt" in out_p:
+                print('<h4>Connection</h4><pre>' + e(conn) + '</pre>')
+
+        # Binary checks table (components with =value)
+        comp_lines = []
+        for sec in ("OS",):
+            for ln in sections[sec]:
+                if "=" in ln and not ln.startswith("---"):
+                    k, v = ln.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k in ("psql", "sudo", "python3", "pg_lsclusters", "pkgmgr"):
+                        comp_lines.append((k, v))
+        if comp_lines:
+            print('<h4>Components</h4><table><tr><th>Component</th><th>Status</th></tr>')
+            for k, v in comp_lines:
+                good = "missing" not in v and "FAILED" not in v and "not installed" not in v and "optional" not in v
+                col = "green" if good else ("orange" if "optional" in v else "red")
+                print(f"<tr><td><code>{e(k)}</code></td><td style='color:{col}'>{e(v)}</td></tr>")
+            print('</table>')
+
+        # Install button for apt
+        pkgmgr = ""
+        for k, v in os_kv:
+            if k == "pkgmgr":
+                pkgmgr = v
+                break
+        missing_any = any("missing" in v for _, v in comp_lines)
+        if missing_any and pkgmgr == "apt":
             print('<form method="POST" action="/CMD_PLUGINS_ADMIN/postgres_manager" '
                   'onsubmit="return confirm(\'Install PostgreSQL via apt (may take a few minutes)?\')">'
                   '<input type="hidden" name="action" value="pg_install">'
                   '<input type="submit" value="Install PostgreSQL (apt)">'
                   '</form><p style="font-size:12px">Debian/Ubuntu only: runs '
                   '<code>apt-get update && apt-get install -y postgresql sudo python3</code> as root.</p>')
-        elif "missing" in out_p:
+        elif missing_any:
             print('<p style="color:#b06000">Automatic install is only supported on Debian/Ubuntu (apt). '
                   'On RHEL/Alma/Rocky run as root: <code>dnf install -y postgresql-server sudo python3 && '
                   'postgresql-setup --initdb && systemctl enable --now postgresql</code></p>')
+
     print('</div>')
     # --- server checks (auth config that app logins depend on) ---
     settings, hba = {}, []
